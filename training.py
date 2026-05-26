@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
 import joblib
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
@@ -15,27 +14,34 @@ from sklearn.model_selection import train_test_split
 
 from classifier import classify_signal
 from config import settings
-from fetcher import PolymarketFetcher, _market_category, _market_condition_id, _parse_datetime
-from fft_engine import reconstruct_dominant_cycle, run_fft_analysis
+from fetcher import (
+    PolymarketFetcher,
+    _market_category,
+    _market_condition_id,
+    _market_history_ids,
+    _market_volume_24h,
+    _parse_datetime,
+)
+from fft_engine import (
+    estimate_reversion_target,
+    reconstruct_cycle_price,
+    resample_price_history,
+    run_fft_analysis,
+)
 from ml import FEATURE_COLUMNS, TARGET_COLUMN
 
 
 def determine_direction_simple(window: list[float], features: dict[str, Any]) -> str | None:
-    reconstructed = reconstruct_dominant_cycle(window, float(features["dominant_freq"]))
-    current_price = window[-1]
-    target_price = float(reconstructed[-1])
-    if current_price < target_price:
-        return "BUY_YES"
-    if current_price > target_price:
-        return "BUY_NO"
-    return None
+    _target_price, direction = estimate_reversion_target(window, features)
+    return direction
 
 
 def generate_training_samples(contract: dict[str, Any]) -> list[dict[str, Any]]:
     prices = contract["prices"]
     samples: list[dict[str, Any]] = []
 
-    for end_idx in range(settings.min_price_history_hours, len(prices), settings.run_interval_hours):
+    step_hours = max(1, settings.run_interval_minutes // 60)
+    for end_idx in range(settings.min_price_history_hours, len(prices), step_hours):
         window = prices[:end_idx]
         features = run_fft_analysis(window)
         signal_class = classify_signal(features)
@@ -49,7 +55,7 @@ def generate_training_samples(contract: dict[str, Any]) -> list[dict[str, Any]]:
         if len(future_window) < 24 or direction is None:
             continue
 
-        reconstructed = reconstruct_dominant_cycle(window, float(features["dominant_freq"]))
+        reconstructed = reconstruct_cycle_price(window, float(features["dominant_freq"]))
         target_price = float(reconstructed[-1])
 
         if direction == "BUY_YES":
@@ -61,9 +67,10 @@ def generate_training_samples(contract: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 **features,
                 "category": contract["category"],
-                "volume": contract["volume"],
+                "volume": contract["volume_24h"],
                 "duration_days": contract["duration_days"],
                 "current_price": current_price,
+                "target_price": target_price,
                 "direction": direction,
                 "label": 1 if reverted else 0,
             }
@@ -75,16 +82,25 @@ def generate_training_samples(contract: dict[str, Any]) -> list[dict[str, Any]]:
 async def fetch_resolved_contracts(days_back: int = 180, limit: int = 500) -> list[dict[str, Any]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     fetcher = PolymarketFetcher()
-    async with httpx.AsyncClient(
-        base_url=settings.polymarket_clob_url,
-        timeout=settings.request_timeout_seconds,
-        headers={"Accept": "application/json", "User-Agent": "fft-signal-agent/1.0"},
-    ) as client:
-        payload = await fetcher._get(client, "/markets", params={"closed": True, "limit": limit})
-
-    markets = payload.get("data") if isinstance(payload, dict) else payload
-    if not isinstance(markets, list):
-        return []
+    markets: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while len(markets) < limit:
+        params: dict[str, Any] = {"closed": "true", "limit": min(500, limit - len(markets))}
+        if cursor:
+            params["next_cursor"] = cursor
+        payload = await fetcher._get("/markets", params=params)
+        page = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(page, list):
+            break
+        markets.extend(market for market in page if isinstance(market, dict))
+        next_cursor = (
+            payload.get("next_cursor") or payload.get("nextCursor")
+            if isinstance(payload, dict)
+            else None
+        )
+        if not next_cursor or next_cursor == "LTE=":
+            break
+        cursor = str(next_cursor)
 
     resolved: list[dict[str, Any]] = []
     for market in markets:
@@ -98,7 +114,13 @@ async def fetch_resolved_contracts(days_back: int = 180, limit: int = 500) -> li
         )
         if end_date and end_date < cutoff:
             continue
-        prices, _timestamps = await fetcher.fetch_price_history(condition_id)
+        prices: list[float] = []
+        timestamps: list[int] = []
+        for history_id in _market_history_ids(market):
+            prices, timestamps = await fetcher.fetch_price_history(history_id)
+            if len(prices) >= settings.min_price_history_hours:
+                break
+        prices, timestamps = resample_price_history(prices, timestamps)
         if len(prices) < settings.min_price_history_hours:
             continue
         resolved.append(
@@ -108,7 +130,8 @@ async def fetch_resolved_contracts(days_back: int = 180, limit: int = 500) -> li
                 "category": _market_category(market),
                 "resolved_value": float(market.get("resolved_value") or market.get("resolvedValue") or 0),
                 "prices": prices,
-                "volume": float(market.get("volume") or market.get("volumeNum") or 0),
+                "timestamps": timestamps,
+                "volume_24h": _market_volume_24h(market),
                 "duration_days": max(len(prices) / 24, 0),
             }
         )
@@ -181,4 +204,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

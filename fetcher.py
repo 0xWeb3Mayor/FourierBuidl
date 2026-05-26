@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from config import Settings, settings
+from fft_engine import resample_price_history
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -65,6 +66,18 @@ def _market_volume_24h(market: dict[str, Any]) -> float:
             default=0,
         )
     )
+
+
+def _market_spread(market: dict[str, Any]) -> float | None:
+    bid = _field(market, "best_bid", "bestBid", "bid", default=None)
+    ask = _field(market, "best_ask", "bestAsk", "ask", default=None)
+    if bid is None or ask is None:
+        return None
+    bid_float = _as_float(bid, default=-1)
+    ask_float = _as_float(ask, default=-1)
+    if bid_float < 0 or ask_float < 0 or ask_float < bid_float:
+        return None
+    return ask_float - bid_float
 
 
 def _market_end_date(market: dict[str, Any]) -> datetime | None:
@@ -210,6 +223,9 @@ class PolymarketFetcher:
             return False
         if _market_volume_24h(market) <= self.cfg.min_volume_24h:
             return False
+        spread = _market_spread(market)
+        if self.cfg.max_spread is not None and spread is not None and spread > self.cfg.max_spread:
+            return False
         end_date = _market_end_date(market)
         if end_date:
             hours_to_resolution = (end_date - datetime.now(timezone.utc)).total_seconds() / 3600
@@ -235,6 +251,7 @@ class PolymarketFetcher:
                     continue
                 if len(prices) >= self.cfg.min_price_history_hours:
                     break
+            prices, timestamps = resample_price_history(prices, timestamps)
             if len(prices) < self.cfg.min_price_history_hours:
                 return None
             return {
@@ -243,6 +260,9 @@ class PolymarketFetcher:
                 "category": _market_category(market),
                 "end_date": _market_end_date(market),
                 "volume_24h": _market_volume_24h(market),
+                "spread": _market_spread(market),
+                "current_price": float(prices[-1]) if prices else None,
+                "duration_days": max(len(prices) / 24, 0),
                 "prices": prices,
                 "timestamps": timestamps,
                 "market_url": _field(market, "market_url", "url", "slug", default=None),

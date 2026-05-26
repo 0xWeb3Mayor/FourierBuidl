@@ -7,13 +7,31 @@ from datetime import datetime
 from typing import Any
 
 from config import settings
-from db import init_db, log_signal, update_signal_alert_sent
+from db import (
+    get_outcome_candidates,
+    init_db,
+    log_signal,
+    update_signal_alert_sent,
+    update_signal_outcome,
+)
+from outcomes import evaluate_signal_outcome
+
+
+def update_post_alert_outcomes(contract: dict[str, Any]) -> None:
+    timestamps = contract.get("timestamps") or []
+    prices = contract.get("prices") or []
+    if not timestamps or not prices:
+        return
+    for signal in get_outcome_candidates(str(contract["condition_id"])):
+        outcome = evaluate_signal_outcome(signal, prices, timestamps)
+        if outcome:
+            update_signal_outcome(int(signal["id"]), outcome)
 
 
 async def run_agent_once() -> list[dict[str, Any]]:
     from classifier import classify_signal
     from fetcher import fetch_active_contracts
-    from fft_engine import run_fft_analysis
+    from fft_engine import estimate_reversion_target, run_fft_analysis
     from telegram import maybe_send_alert
 
     init_db()
@@ -26,8 +44,16 @@ async def run_agent_once() -> list[dict[str, Any]]:
         if len(contract["prices"]) < settings.min_price_history_hours:
             continue
 
+        update_post_alert_outcomes(contract)
+
         try:
             features = run_fft_analysis(contract["prices"])
+            target_price, direction = estimate_reversion_target(contract["prices"], features)
+            features = {
+                **features,
+                "target_price": target_price,
+                "direction": direction,
+            }
             signal_class = classify_signal(features)
         except Exception as exc:
             print(f"[{datetime.now()}] skipped {contract.get('condition_id')}: {exc}")

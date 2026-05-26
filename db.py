@@ -23,6 +23,17 @@ CREATE TABLE IF NOT EXISTS signal_log (
   deviation_score REAL,
   signal_class TEXT,
   alert_sent INTEGER DEFAULT 0,
+  target_price REAL,
+  direction TEXT,
+  volume_24h REAL,
+  spread REAL,
+  price_24h REAL,
+  price_48h REAL,
+  price_72h REAL,
+  reverted_24h INTEGER,
+  reverted_48h INTEGER,
+  reverted_72h INTEGER,
+  outcome_checked_at INTEGER,
   resolved INTEGER DEFAULT 0,
   resolved_price REAL
 );
@@ -45,6 +56,21 @@ ON alert_log(condition_id, alert_timestamp);
 """
 
 
+SIGNAL_LOG_MIGRATIONS = {
+    "target_price": "ALTER TABLE signal_log ADD COLUMN target_price REAL",
+    "direction": "ALTER TABLE signal_log ADD COLUMN direction TEXT",
+    "volume_24h": "ALTER TABLE signal_log ADD COLUMN volume_24h REAL",
+    "spread": "ALTER TABLE signal_log ADD COLUMN spread REAL",
+    "price_24h": "ALTER TABLE signal_log ADD COLUMN price_24h REAL",
+    "price_48h": "ALTER TABLE signal_log ADD COLUMN price_48h REAL",
+    "price_72h": "ALTER TABLE signal_log ADD COLUMN price_72h REAL",
+    "reverted_24h": "ALTER TABLE signal_log ADD COLUMN reverted_24h INTEGER",
+    "reverted_48h": "ALTER TABLE signal_log ADD COLUMN reverted_48h INTEGER",
+    "reverted_72h": "ALTER TABLE signal_log ADD COLUMN reverted_72h INTEGER",
+    "outcome_checked_at": "ALTER TABLE signal_log ADD COLUMN outcome_checked_at INTEGER",
+}
+
+
 def connect(db_path: Path = settings.database_path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -55,6 +81,12 @@ def connect(db_path: Path = settings.database_path) -> sqlite3.Connection:
 def init_db(db_path: Path = settings.database_path) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        existing_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(signal_log)").fetchall()
+        }
+        for column, statement in SIGNAL_LOG_MIGRATIONS.items():
+            if column not in existing_columns:
+                conn.execute(statement)
 
 
 def log_signal(
@@ -75,16 +107,16 @@ def log_signal(
             INSERT INTO signal_log (
               run_timestamp, condition_id, question, category, current_price,
               dominant_freq, cycle_days, amplitude, noise_ratio, deviation_score,
-              signal_class, alert_sent
+              signal_class, alert_sent, target_price, direction, volume_24h, spread
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_timestamp,
                 contract.get("condition_id"),
                 contract.get("question"),
                 contract.get("category"),
-                current_price,
+                contract.get("current_price", current_price),
                 features.get("dominant_freq"),
                 features.get("cycle_days"),
                 features.get("amplitude"),
@@ -92,6 +124,10 @@ def log_signal(
                 features.get("deviation_score"),
                 signal_class,
                 1 if alert_sent else 0,
+                features.get("target_price"),
+                features.get("direction"),
+                contract.get("volume_24h"),
+                contract.get("spread"),
             ),
         )
         return int(cursor.lastrowid)
@@ -163,3 +199,108 @@ def mark_suppressed(condition_id: str, db_path: Path = settings.database_path) -
             "INSERT INTO alert_log (condition_id, alert_timestamp, suppressed) VALUES (?, ?, 1)",
             (condition_id, int(time.time() * 1000)),
         )
+
+
+def get_latest_signals(
+    limit: int = 50,
+    signal_class: str | None = None,
+    db_path: Path = settings.database_path,
+) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 500))
+    where = ""
+    params: list[Any] = []
+    if signal_class:
+        where = "WHERE signal_class = ?"
+        params.append(signal_class)
+    params.append(limit)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM signal_log
+            {where}
+            ORDER BY run_timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_signal_summary(db_path: Path = settings.database_path) -> dict[str, Any]:
+    with connect(db_path) as conn:
+        total = conn.execute("SELECT COUNT(*) AS count FROM signal_log").fetchone()
+        by_class = conn.execute(
+            """
+            SELECT signal_class, COUNT(*) AS count
+            FROM signal_log
+            GROUP BY signal_class
+            ORDER BY count DESC
+            """
+        ).fetchall()
+        anomaly_outcomes = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS checked,
+              SUM(CASE WHEN reverted_72h = 1 THEN 1 ELSE 0 END) AS hits
+            FROM signal_log
+            WHERE signal_class = 'ANOMALY' AND reverted_72h IS NOT NULL
+            """
+        ).fetchone()
+    checked = int(anomaly_outcomes["checked"] or 0)
+    hits = int(anomaly_outcomes["hits"] or 0)
+    return {
+        "total_signals": int(total["count"] or 0),
+        "by_class": {row["signal_class"]: int(row["count"]) for row in by_class},
+        "anomaly_outcomes_72h": {
+            "checked": checked,
+            "hits": hits,
+            "hit_rate": hits / checked if checked else None,
+        },
+    }
+
+
+def get_outcome_candidates(
+    condition_id: str,
+    db_path: Path = settings.database_path,
+) -> list[dict[str, Any]]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM signal_log
+            WHERE condition_id = ?
+              AND signal_class = 'ANOMALY'
+              AND target_price IS NOT NULL
+              AND direction IS NOT NULL
+              AND (
+                reverted_24h IS NULL OR reverted_48h IS NULL OR reverted_72h IS NULL
+              )
+            ORDER BY run_timestamp ASC
+            """,
+            (condition_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_signal_outcome(
+    row_id: int,
+    outcome: dict[str, Any],
+    db_path: Path = settings.database_path,
+) -> None:
+    fields = [
+        "price_24h",
+        "price_48h",
+        "price_72h",
+        "reverted_24h",
+        "reverted_48h",
+        "reverted_72h",
+        "outcome_checked_at",
+    ]
+    assignments = ", ".join(f"{field} = ?" for field in fields if field in outcome)
+    values = [outcome[field] for field in fields if field in outcome]
+    if not assignments:
+        return
+    values.append(row_id)
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE signal_log SET {assignments} WHERE id = ?", values)

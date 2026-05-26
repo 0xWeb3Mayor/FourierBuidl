@@ -46,6 +46,18 @@ When `HEALTH_CHECK_ENABLED=true`, the scheduler also exposes `GET /health` on `P
 
 `RUN_INTERVAL_MINUTES` controls scan cadence and overrides the older `RUN_INTERVAL_HOURS` setting. The local default is 60 minutes.
 
+## Live Analysis API
+
+When the health server is enabled, these JSON endpoints are available:
+
+```bash
+GET /signals/latest?limit=50
+GET /signals/anomalies?limit=50
+GET /signals/summary
+```
+
+Use these from your frontend after deploying the backend to Render.
+
 ## Database
 
 The SQLite schema matches the PRD `signal_log` table. Every evaluated contract is logged, not just anomalies. Alerts are tracked in `alert_log` to enforce:
@@ -65,7 +77,15 @@ python training.py --days-back 180 --limit 500
 
 The model is saved to `models/signal_classifier_current.pkl`. Live Phase 1 still uses the rule-based classifier by default, matching the PRD. `ml.py` provides the Phase 2-ready classifier wrapper.
 
-## Railway
+Run a historical anomaly reversion backtest:
+
+```bash
+python backtest.py --days-back 180 --limit 500
+```
+
+The PRD requires at least a 60% 72-hour anomaly reversion hit rate before treating the signal as Phase 2-ready.
+
+## Render
 
 Use this start command:
 

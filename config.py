@@ -49,6 +49,9 @@ class Settings:
         os.getenv("RUN_INTERVAL_MINUTES", str(int(os.getenv("RUN_INTERVAL_HOURS", "6")) * 60))
     )
     min_volume_24h: float = float(os.getenv("MIN_VOLUME_24H", "10000"))
+    max_spread: float | None = (
+        float(os.getenv("MAX_SPREAD")) if os.getenv("MAX_SPREAD") else None
+    )
     min_price_history_hours: int = int(os.getenv("MIN_PRICE_HISTORY_HOURS", "336"))
     resolution_buffer_hours: int = int(os.getenv("RESOLUTION_BUFFER_HOURS", "48"))
     request_timeout_seconds: float = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
