@@ -1,0 +1,20 @@
+[project]
+name = "fft-signal-agent"
+version = "0.1.0"
+description = "FFT Signal Agent with Telegram alerts for Polymarket contracts"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "APScheduler==3.10.4",
+  "httpx==0.27.2",
+  "joblib==1.4.2",
+  "numpy==1.26.4",
+  "pandas==2.2.2",
+  "python-dotenv==1.0.1",
+  "scikit-learn==1.5.1",
+  "scipy==1.13.1",
+  "tenacity==8.5.0",
+]
+
+[tool.uv]
+package = false
+
